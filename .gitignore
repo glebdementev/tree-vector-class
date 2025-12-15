@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and dependency caches
+venv/
+env/
+.venv/
+pip-selfcheck.json
+
+# IDE/editor metadata
+.idea/
+.vscode/
+*.iml
+
+# Logs, caches, and databases
+*.log
+*.sqlite3
+.pytest_cache/
+.mypy_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Generated and temporary files
+output/
+*.joblib
+*.png
+*.cache
+
+# Training metadata and checkpoints
+src/catboost_info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+*.pyc
+*.pyo
+.DS_Store
+
