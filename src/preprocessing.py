@@ -68,6 +68,9 @@ class DataPreprocessor:
         # Step 5: Encode target labels
         y_encoded = self._encode_target(y)
         
+        # Step 5.5: Create derived features (NEW)
+        X = self._create_derived_features(X)
+        
         if self.use_feature_selection:
             # Step 6: Drop known redundant features (domain knowledge)
             X = self._drop_manual_features(X)
@@ -186,6 +189,51 @@ class DataPreprocessor:
             print(f"    {cls} → {i} (n={count})")
         
         return y_encoded
+    
+    def _create_derived_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create domain-specific derived features for tree species classification.
+        
+        These features capture crown shape, vertical distribution, and color-intensity
+        relationships that help distinguish between species.
+        """
+        print(f"\n  Creating derived features...")
+        n_original = len(X.columns)
+        
+        # Crown shape features (distinguish conifers from deciduous)
+        if 'crown_volume_3d' in X.columns and 'crown_area_2d' in X.columns and 'height_range' in X.columns:
+            X['crown_compactness'] = X['crown_volume_3d'] / (X['crown_area_2d'] * X['height_range'] + 1e-6)
+        
+        if 'height_range' in X.columns and 'crown_diameter' in X.columns:
+            X['crown_elongation'] = X['height_range'] / (X['crown_diameter'] + 1e-6)
+        
+        # Vertical distribution ratios
+        if all(col in X.columns for col in ['density_upper', 'density_middle', 'density_lower']):
+            total_density = X['density_lower'] + X['density_middle'] + X['density_upper'] + 1e-6
+            X['upper_to_total_density'] = X['density_upper'] / total_density
+        
+        if 'vertical_centroid' in X.columns and 'height_width_ratio' in X.columns:
+            X['canopy_shape_index'] = X['vertical_centroid'] * X['height_width_ratio']
+        
+        # Color-intensity interactions (birch vs. conifers)
+        if 'green_mean' in X.columns and 'intensity_mean' in X.columns:
+            X['green_intensity_ratio'] = X['green_mean'] / (X['intensity_mean'] + 1e-6)
+        
+        if all(col in X.columns for col in ['red_mean', 'blue_mean', 'green_mean']):
+            X['rgb_balance'] = (X['red_mean'] - X['blue_mean']) / (X['green_mean'] + 1e-6)
+        
+        # Height distribution features
+        if all(col in X.columns for col in ['height_p99', 'height_p50', 'height_p25']):
+            X['height_quartile_ratio'] = (X['height_p99'] - X['height_p50']) / (X['height_p50'] - X['height_p25'] + 1e-6)
+        
+        # Penetration-density relationship
+        if 'laser_penetration_proxy' in X.columns and 'point_density' in X.columns:
+            X['penetration_density_ratio'] = X['laser_penetration_proxy'] / (X['point_density'] + 1e-6)
+        
+        n_created = len(X.columns) - n_original
+        print(f"  ✓ Created {n_created} derived features")
+        
+        return X
     
     def _drop_manual_features(self, X: pd.DataFrame) -> pd.DataFrame:
         """

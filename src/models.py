@@ -19,7 +19,8 @@ import joblib
 
 from config import (
     RANDOM_STATE, N_SPLITS, SCORING_METRIC, MODELS_DIR,
-    XGBOOST_PARAMS, CATBOOST_PARAMS, BALANCED_RF_PARAMS, LIGHTGBM_PARAMS
+    XGBOOST_PARAMS, CATBOOST_PARAMS, BALANCED_RF_PARAMS, LIGHTGBM_PARAMS,
+    EARLY_STOPPING_ROUNDS
 )
 
 # Try to import LightGBM
@@ -124,22 +125,35 @@ class ModelTrainer:
         return f1_score(y_val, y_pred, average='macro')
     
     def train_xgboost(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train XGBoost with fixed hyperparameters."""
+        """Train XGBoost with early stopping."""
+        from sklearn.model_selection import train_test_split
         print("🚀 Training XGBoost...", end=" ", flush=True)
         
         sample_weights = None
         if self.class_weights:
             sample_weights = np.array([self.class_weights[y] for y in y_train])
         
+        # Split for early stopping
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+        )
+        
         model = self._get_xgboost_model()
         
-        if sample_weights is not None:
-            model.fit(X_train, y_train, sample_weight=sample_weights)
-        else:
-            model.fit(X_train, y_train)
+        fit_params = {
+            'eval_set': [(X_val, y_val)],
+            'verbose': False,
+        }
         
-        # Quick validation score
-        val_score = self._quick_cv_score(self._get_xgboost_model(), X_train, y_train, sample_weights)
+        if sample_weights is not None:
+            sw_tr = np.array([self.class_weights[y] for y in y_tr])
+            fit_params['sample_weight'] = sw_tr
+        
+        model.fit(X_tr, y_tr, **fit_params)
+        
+        # Validation score
+        y_pred = model.predict(X_val)
+        val_score = f1_score(y_val, y_pred, average='macro')
         
         self.models['xgboost'] = model
         self.cv_scores['xgboost'] = val_score
@@ -148,14 +162,28 @@ class ModelTrainer:
         return model
     
     def train_catboost(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train CatBoost with fixed hyperparameters."""
+        """Train CatBoost with early stopping."""
+        from sklearn.model_selection import train_test_split
+        from catboost import Pool
         print("🚀 Training CatBoost...", end=" ", flush=True)
         
-        model = self._get_catboost_model()
-        model.fit(X_train, y_train, verbose=False)
+        # Split for early stopping
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+        )
         
-        # Quick validation score
-        val_score = self._quick_cv_score(self._get_catboost_model(), X_train, y_train)
+        model = self._get_catboost_model()
+        
+        model.fit(
+            X_tr, y_tr,
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            verbose=False
+        )
+        
+        # Validation score
+        y_pred = model.predict(X_val)
+        val_score = f1_score(y_val, y_pred, average='macro')
         
         self.models['catboost'] = model
         self.cv_scores['catboost'] = val_score
@@ -164,14 +192,21 @@ class ModelTrainer:
         return model
     
     def train_balanced_rf(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train BalancedRandomForest with fixed hyperparameters."""
+        """Train BalancedRandomForest (no early stopping for RF)."""
+        from sklearn.model_selection import train_test_split
         print("🚀 Training BalancedRF...", end=" ", flush=True)
         
-        model = self._get_balanced_rf_model()
-        model.fit(X_train, y_train)
+        # Split for validation score
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+        )
         
-        # Quick validation score
-        val_score = self._quick_cv_score(self._get_balanced_rf_model(), X_train, y_train)
+        model = self._get_balanced_rf_model()
+        model.fit(X_tr, y_tr)
+        
+        # Validation score
+        y_pred = model.predict(X_val)
+        val_score = f1_score(y_val, y_pred, average='macro')
         
         self.models['balanced_rf'] = model
         self.cv_scores['balanced_rf'] = val_score
@@ -180,18 +215,30 @@ class ModelTrainer:
         return model
     
     def train_lightgbm(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train LightGBM with fixed hyperparameters."""
+        """Train LightGBM with early stopping."""
         if not LIGHTGBM_AVAILABLE:
             print("⚠️  LightGBM not available, skipping...")
             return None
         
+        from sklearn.model_selection import train_test_split
         print("🚀 Training LightGBM...", end=" ", flush=True)
         
-        model = self._get_lightgbm_model()
-        model.fit(X_train, y_train)
+        # Split for early stopping
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+        )
         
-        # Quick validation score
-        val_score = self._quick_cv_score(self._get_lightgbm_model(), X_train, y_train)
+        model = self._get_lightgbm_model()
+        
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)]
+        )
+        
+        # Validation score
+        y_pred = model.predict(X_val)
+        val_score = f1_score(y_val, y_pred, average='macro')
         
         self.models['lightgbm'] = model
         self.cv_scores['lightgbm'] = val_score
@@ -203,9 +250,10 @@ class ModelTrainer:
         self, 
         X_train: pd.DataFrame, 
         y_train: np.ndarray,
-        include_lightgbm: bool = True
+        include_lightgbm: bool = True,
+        include_stacking: bool = True
     ) -> Dict[str, Any]:
-        """Train all models with fixed hyperparameters."""
+        """Train all models with early stopping."""
         print("\n🎯 Training models...")
         
         self.train_xgboost(X_train, y_train)
@@ -215,7 +263,63 @@ class ModelTrainer:
         if include_lightgbm and LIGHTGBM_AVAILABLE:
             self.train_lightgbm(X_train, y_train)
         
+        if include_stacking:
+            self.train_stacking_ensemble(X_train, y_train, include_lightgbm)
+        
         return self.models
+    
+    def train_stacking_ensemble(
+        self, 
+        X_train: pd.DataFrame, 
+        y_train: np.ndarray,
+        include_lightgbm: bool = True
+    ) -> Any:
+        """Train stacking ensemble with base models."""
+        from sklearn.ensemble import StackingClassifier
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import train_test_split
+        
+        print("🚀 Training Stacking Ensemble...", end=" ", flush=True)
+        
+        # Build estimators list
+        estimators = [
+            ('xgboost', self._get_xgboost_model()),
+            ('catboost', self._get_catboost_model()),
+            ('balanced_rf', self._get_balanced_rf_model()),
+        ]
+        
+        if include_lightgbm and LIGHTGBM_AVAILABLE:
+            estimators.append(('lightgbm', self._get_lightgbm_model()))
+        
+        stacking = StackingClassifier(
+            estimators=estimators,
+            final_estimator=LogisticRegression(
+                max_iter=1000, 
+                class_weight='balanced',
+                random_state=RANDOM_STATE
+            ),
+            cv=5,
+            stack_method='predict_proba',
+            passthrough=False,
+            n_jobs=-1,
+        )
+        
+        # Split for validation score
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+        )
+        
+        stacking.fit(X_tr, y_tr)
+        
+        # Validation score
+        y_pred = stacking.predict(X_val)
+        val_score = f1_score(y_val, y_pred, average='macro')
+        
+        self.models['stacking'] = stacking
+        self.cv_scores['stacking'] = val_score
+        
+        print(f"Done! Val Score: {val_score:.4f}")
+        return stacking
     
     def get_cv_scores_summary(self) -> pd.DataFrame:
         """Get summary of cross-validation scores for all models."""
@@ -241,7 +345,7 @@ class ModelTrainer:
     
     def load_models(self, prefix: str = "") -> Dict[str, Any]:
         """Load all models from disk."""
-        model_names = ['xgboost', 'catboost', 'balanced_rf', 'lightgbm']
+        model_names = ['xgboost', 'catboost', 'balanced_rf', 'lightgbm', 'stacking']
         
         for model_name in model_names:
             filename = MODELS_DIR / f"{prefix}{model_name}_model.joblib"

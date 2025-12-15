@@ -49,34 +49,51 @@ FEATURES_TO_DROP = [
 ]
 
 # Cross-validation settings
-N_SPLITS = 3  # Reduced for speed
+N_SPLITS = 5  # Increased for better generalization estimates
 SCORING_METRIC = "f1_macro"
 
+# Early stopping settings
+EARLY_STOPPING_ROUNDS = 50
+
 # ============================================================================
-# FIXED HYPERPARAMETERS - FAST TRAINING
+# OPTIMIZED HYPERPARAMETERS - WITH REGULARIZATION
 # ============================================================================
 
 XGBOOST_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 5,
-    'learning_rate': 0.15,
+    'n_estimators': 500,
+    'max_depth': 6,
+    'learning_rate': 0.05,
+    'min_child_weight': 3,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'reg_alpha': 0.1,
+    'reg_lambda': 1.0,
 }
 
 CATBOOST_PARAMS = {
-    'iterations': 100,
-    'depth': 5,
-    'learning_rate': 0.15,
+    'iterations': 500,
+    'depth': 6,
+    'learning_rate': 0.05,
+    'l2_leaf_reg': 3,
+    'border_count': 128,
 }
 
 BALANCED_RF_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 12,
+    'n_estimators': 200,
+    'max_depth': 15,
+    'min_samples_split': 5,
+    'min_samples_leaf': 2,
 }
 
 LIGHTGBM_PARAMS = {
-    'n_estimators': 100,
+    'n_estimators': 500,
     'max_depth': 6,
-    'learning_rate': 0.15,
+    'learning_rate': 0.05,
     'num_leaves': 31,
+    'min_child_samples': 20,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'reg_alpha': 0.1,
+    'reg_lambda': 1.0,
 }
 
