@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
 Generate vertical heightmaps from LAS point cloud.
-Projects XZ and YZ planes by slicing the cloud in the middle.
-4 views: XZ+, XZ-, YZ+, YZ- (from both sides of each plane)
+Projects the cloud onto XZ and YZ planes.
+4 views: XZ (+Y / -Y) and YZ (+X / -X).
 
-Depth = distance from the central slice plane.
-Each view only uses points on its side of the center.
+Depth is measured from a "backplane" placed at the far boundary for each view,
+so all points are in front of it (like a backlight/background).
 """
 
 import laspy
 import numpy as np
-from scipy import ndimage
 from PIL import Image
 from pathlib import Path
 
 # Load the LAS file
-las_path = Path("/home/gleb/dev/ol-class/tree_16104.las")
+las_path = Path("./tree_16104.las")
 las = laspy.read(las_path)
 
 # Extract coordinates
@@ -40,24 +39,16 @@ x_extent = x.max()
 y_extent = y.max()
 z_extent = z.max()
 
-# Calculate center
-x_center = x_extent / 2
-y_center = y_extent / 2
-
-# Slice thickness - 20% of the dimension extent (10% on each side of center)
-slice_thickness_x = x_extent * 0.2
-slice_thickness_y = y_extent * 0.2
-
 print(f"\nAfter centering to origin:")
-print(f"X: 0 to {x_extent:.3f}, center={x_center:.3f}")
-print(f"Y: 0 to {y_extent:.3f}, center={y_center:.3f}")
+print(f"X: 0 to {x_extent:.3f}")
+print(f"Y: 0 to {y_extent:.3f}")
 print(f"Z: 0 to {z_extent:.3f}")
 
 # Resolution in pixels per meter
 pixels_per_meter = 10
-resolution_x = int(np.ceil(x_extent * pixels_per_meter))
-resolution_y = int(np.ceil(y_extent * pixels_per_meter))
-resolution_z = int(np.ceil(z_extent * pixels_per_meter))
+resolution_x = max(1, int(np.ceil(x_extent * pixels_per_meter)))
+resolution_y = max(1, int(np.ceil(y_extent * pixels_per_meter)))
+resolution_z = max(1, int(np.ceil(z_extent * pixels_per_meter)))
 
 print(f"\n" + "=" * 50)
 print("OUTPUT")
@@ -67,26 +58,19 @@ print(f"XZ image size: {resolution_x} x {resolution_z}")
 print(f"YZ image size: {resolution_y} x {resolution_z}")
 
 
-def apply_median_filter_preserve(image):
-    """
-    Apply 3x3 median filter but preserve cells that have data.
-    """
-    has_data = image > 0
-    filtered = ndimage.median_filter(image, size=3)
-    result = np.where(has_data, np.maximum(image, filtered), filtered)
-    return result
-
-
 def create_heightmap(horiz_coords, depth_values, vert_coords,
                      horiz_extent, vert_extent,
                      max_depth,
                      res_h, res_v):
     """
-    Create a heightmap where pixel intensity = depth from center plane.
+    Create a heightmap where pixel intensity = depth *amplitude* in the pixel:
+    (max depth - min depth) among points that land in that pixel.
+
+    If a pixel contains fewer than 2 points, its value is 0.
     
     Args:
         horiz_coords: horizontal axis coordinates (X for XZ, Y for YZ)
-        depth_values: pre-computed depth from center plane (always positive)
+        depth_values: pre-computed depth from backplane (always positive)
         vert_coords: vertical axis (always Z)
         horiz_extent: max horizontal extent
         vert_extent: max vertical extent
@@ -103,10 +87,21 @@ def create_heightmap(horiz_coords, depth_values, vert_coords,
     h_indices = np.clip(np.digitize(horiz_coords, h_bins) - 1, 0, res_h - 1)
     v_indices = np.clip(np.digitize(vert_coords, v_bins) - 1, 0, res_v - 1)
     
-    # For each cell, find the point with maximum depth (closest to viewer)
-    for hi, vi, d in zip(h_indices, v_indices, depth_values):
-        if d > heightmap[vi, hi]:
-            heightmap[vi, hi] = d
+    # For each pixel, compute amplitude (max depth - min depth) if >=2 points.
+    n_pixels = res_h * res_v
+    flat = (v_indices * res_h + h_indices).astype(np.int64, copy=False)
+
+    counts = np.bincount(flat, minlength=n_pixels)
+
+    mins = np.full(n_pixels, np.inf, dtype=float)
+    maxs = np.full(n_pixels, -np.inf, dtype=float)
+    depth_values = np.asarray(depth_values, dtype=float)
+
+    np.minimum.at(mins, flat, depth_values)
+    np.maximum.at(maxs, flat, depth_values)
+
+    amplitudes = np.where(counts >= 2, maxs - mins, 0.0)
+    heightmap = amplitudes.reshape((res_v, res_h))
     
     # Normalize to [0, 1]
     if max_depth > 0:
@@ -115,14 +110,9 @@ def create_heightmap(horiz_coords, depth_values, vert_coords,
     return heightmap
 
 
-def save_heightmap(heightmap, path, apply_filter=True):
+def save_heightmap(heightmap, path):
     """Save heightmap as grayscale PNG with Z=0 at bottom."""
     cells_before = np.sum(heightmap > 0)
-    
-    if apply_filter:
-        heightmap = apply_median_filter_preserve(heightmap)
-    
-    cells_after = np.sum(heightmap > 0)
     
     # Normalize to 0-255
     if heightmap.max() > 0:
@@ -137,89 +127,62 @@ def save_heightmap(heightmap, path, apply_filter=True):
     
     img = Image.fromarray(hm_uint8, mode='L')
     img.save(path)
-    print(f"Saved: {path} ({img.width}x{img.height}, {cells_before}->{cells_after} cells)")
+    print(f"Saved: {path} ({img.width}x{img.height}, {cells_before} cells)")
 
 
-# --- Get slices ---
+# --- Backplanes / view setup ---
 print("\n" + "=" * 50)
-print("SLICE STATISTICS")
+print("VIEW PLANES")
 print("=" * 50)
+print("Using backplanes on the far boundary so all points are in front.")
+print(f"XZ views depth axis = Y, planes at Y=0 and Y={y_extent:.3f}")
+print(f"YZ views depth axis = X, planes at X=0 and X={x_extent:.3f}")
 
-# XZ slice bounds
-y_slice_min = y_center - slice_thickness_y / 2
-y_slice_max = y_center + slice_thickness_y / 2
-
-# Points in the XZ slice region
-xz_mask = (y >= y_slice_min) & (y <= y_slice_max)
-
-# Split into +Y side and -Y side
-xz_pos_mask = xz_mask & (y > y_center)  # +Y side: y > y_center
-xz_neg_mask = xz_mask & (y < y_center)  # -Y side: y < y_center
-
-print(f"\nXZ slice (Y center = {y_center:.3f}, thickness = {slice_thickness_y:.3f}):")
-print(f"  +Y side (y > {y_center:.3f}): {np.sum(xz_pos_mask)} points")
-print(f"  -Y side (y < {y_center:.3f}): {np.sum(xz_neg_mask)} points")
-
-# YZ slice bounds
-x_slice_min = x_center - slice_thickness_x / 2
-x_slice_max = x_center + slice_thickness_x / 2
-
-# Points in the YZ slice region
-yz_mask = (x >= x_slice_min) & (x <= x_slice_max)
-
-# Split into +X side and -X side
-yz_pos_mask = yz_mask & (x > x_center)  # +X side: x > x_center
-yz_neg_mask = yz_mask & (x < x_center)  # -X side: x < x_center
-
-print(f"\nYZ slice (X center = {x_center:.3f}, thickness = {slice_thickness_x:.3f}):")
-print(f"  +X side (x > {x_center:.3f}): {np.sum(yz_pos_mask)} points")
-print(f"  -X side (x < {x_center:.3f}): {np.sum(yz_neg_mask)} points")
-
-# Maximum depth for normalization (half the slice thickness)
-max_depth_y = slice_thickness_y / 2
-max_depth_x = slice_thickness_x / 2
+# Maximum depth for normalization (full extent along depth axis)
+max_depth_y = y_extent
+max_depth_x = x_extent
 
 # --- Generate 4 heightmaps ---
 print("\nGenerating heightmaps...")
 
-# XZ from +Y: points where y > y_center, depth = y - y_center
-x_xz_pos = x[xz_pos_mask]
-z_xz_pos = z[xz_pos_mask]
-depth_xz_pos = y[xz_pos_mask] - y_center  # distance from center plane
+# XZ from +Y: backplane at Y=0, depth increases with Y
+x_xz_pos = x
+z_xz_pos = z
+depth_xz_pos = y
 
 xz_pos_hm = create_heightmap(x_xz_pos, depth_xz_pos, z_xz_pos,
                               x_extent, z_extent, max_depth_y,
                               resolution_x, resolution_z)
-save_heightmap(xz_pos_hm, "/home/gleb/dev/ol-class/heightmap_XZ_posY.png")
+save_heightmap(xz_pos_hm, "heightmap_XZ_posY.png")
 
-# XZ from -Y: points where y < y_center, depth = y_center - y
-x_xz_neg = x[xz_neg_mask]
-z_xz_neg = z[xz_neg_mask]
-depth_xz_neg = y_center - y[xz_neg_mask]  # distance from center plane
+# XZ from -Y: backplane at Y=max, depth increases towards smaller Y
+x_xz_neg = x
+z_xz_neg = z
+depth_xz_neg = y_extent - y
 
 xz_neg_hm = create_heightmap(x_xz_neg, depth_xz_neg, z_xz_neg,
                               x_extent, z_extent, max_depth_y,
                               resolution_x, resolution_z)
-save_heightmap(xz_neg_hm, "/home/gleb/dev/ol-class/heightmap_XZ_negY.png")
+save_heightmap(xz_neg_hm, "heightmap_XZ_negY.png")
 
-# YZ from +X: points where x > x_center, depth = x - x_center
-y_yz_pos = y[yz_pos_mask]
-z_yz_pos = z[yz_pos_mask]
-depth_yz_pos = x[yz_pos_mask] - x_center
+# YZ from +X: backplane at X=0, depth increases with X
+y_yz_pos = y
+z_yz_pos = z
+depth_yz_pos = x
 
 yz_pos_hm = create_heightmap(y_yz_pos, depth_yz_pos, z_yz_pos,
                               y_extent, z_extent, max_depth_x,
                               resolution_y, resolution_z)
-save_heightmap(yz_pos_hm, "/home/gleb/dev/ol-class/heightmap_YZ_posX.png")
+save_heightmap(yz_pos_hm, "heightmap_YZ_posX.png")
 
-# YZ from -X: points where x < x_center, depth = x_center - x
-y_yz_neg = y[yz_neg_mask]
-z_yz_neg = z[yz_neg_mask]
-depth_yz_neg = x_center - x[yz_neg_mask]
+# YZ from -X: backplane at X=max, depth increases towards smaller X
+y_yz_neg = y
+z_yz_neg = z
+depth_yz_neg = x_extent - x
 
 yz_neg_hm = create_heightmap(y_yz_neg, depth_yz_neg, z_yz_neg,
                               y_extent, z_extent, max_depth_x,
                               resolution_y, resolution_z)
-save_heightmap(yz_neg_hm, "/home/gleb/dev/ol-class/heightmap_YZ_negX.png")
+save_heightmap(yz_neg_hm, "heightmap_YZ_negX.png")
 
 print("\nDone!")
