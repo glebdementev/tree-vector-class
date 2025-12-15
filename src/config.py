@@ -23,6 +23,7 @@ TARGET_COLUMN = "species"
 ID_COLUMN = "tree_id"
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
+VAL_SIZE = 0.2  # Held-out validation split (used for model selection / early stopping)
 
 # Class mapping (for encoding)
 CLASS_NAMES = ["birch", "cedar", "fir", "larch", "pine", "spruce"]
@@ -31,10 +32,20 @@ N_CLASSES = len(CLASS_NAMES)
 # Preprocessing settings
 CORRELATION_THRESHOLD = 0.90  # Remove features with correlation > this
 OUTLIER_IQR_MULTIPLIER = 1.5  # For outlier detection (not removal for tree-based)
+REMOVE_CORRELATED_FEATURES = True  # Keep the feature space smaller/less redundant for stability
 
 # Feature selection settings
 MIN_VARIANCE_THRESHOLD = 0.01  # Drop near-constant features
 USE_FEATURE_SELECTION = True  # Enable/disable automatic feature selection
+USE_PERMUTATION_FEATURE_SELECTION = True
+PERM_IMPORTANCE_THRESHOLD = 0.0  # conservative: keep features with positive permutation importance
+
+# Imbalance handling
+USE_ADASYN = True
+
+# Optional training-time tuning (kept off by default to avoid overfitting the split)
+TUNE_XGBOOST = False
+TUNE_XGBOOST_N_ITER = 12
 
 # Features to drop based on domain knowledge and correlation analysis
 FEATURES_TO_DROP = [

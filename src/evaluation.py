@@ -529,6 +529,121 @@ class ModelEvaluator:
         df = self.get_comparison_table()
         best_idx = df[metric].idxmax()
         return df.loc[best_idx, 'Model']
+    
+    def optimize_thresholds(
+        self, 
+        y_true: np.ndarray, 
+        y_proba: np.ndarray, 
+        n_classes: int = N_CLASSES
+    ) -> Dict[int, float]:
+        """
+        Find optimal threshold per class on validation set.
+        
+        For multiclass, we adjust the "confidence" needed for each class
+        to maximize per-class F1 scores.
+        
+        Args:
+            y_true: True labels.
+            y_proba: Predicted probabilities.
+            n_classes: Number of classes.
+        
+        Returns:
+            Dictionary mapping class index to optimal threshold.
+        """
+        print("\n🎯 Optimizing per-class thresholds...")
+        
+        thresholds = {}
+        
+        for cls in range(n_classes):
+            best_f1, best_thresh = 0, 0.5
+            
+            for thresh in np.arange(0.15, 0.85, 0.05):
+                # Binary classification for this class
+                y_pred_cls = (y_proba[:, cls] >= thresh).astype(int)
+                y_true_cls = (y_true == cls).astype(int)
+                
+                f1 = f1_score(y_true_cls, y_pred_cls, zero_division=0)
+                
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = thresh
+            
+            thresholds[cls] = best_thresh
+            class_name = self.class_names[cls] if cls < len(self.class_names) else f"Class {cls}"
+            print(f"   {class_name}: threshold={best_thresh:.2f}, F1={best_f1:.3f}")
+        
+        return thresholds
+    
+    def predict_with_thresholds(
+        self, 
+        y_proba: np.ndarray, 
+        thresholds: Dict[int, float]
+    ) -> np.ndarray:
+        """
+        Apply per-class thresholds to probabilities.
+        
+        Adjusts probabilities by dividing by threshold, then takes argmax.
+        Lower threshold = more likely to predict that class.
+        
+        Args:
+            y_proba: Predicted probabilities.
+            thresholds: Dictionary mapping class index to threshold.
+        
+        Returns:
+            Adjusted predictions.
+        """
+        adjusted = y_proba.copy()
+        
+        for cls, thresh in thresholds.items():
+            # Divide by threshold - lower threshold means higher adjusted probability
+            adjusted[:, cls] = adjusted[:, cls] / thresh
+        
+        return adjusted.argmax(axis=1)
+    
+    def evaluate_with_threshold_optimization(
+        self,
+        model_name: str,
+        y_val: np.ndarray,
+        y_val_proba: np.ndarray,
+        y_test: np.ndarray,
+        y_test_proba: np.ndarray
+    ) -> Dict[str, Any]:
+        """
+        Optimize thresholds on validation set and evaluate on test set.
+        
+        Args:
+            model_name: Name of the model.
+            y_val: Validation true labels.
+            y_val_proba: Validation predicted probabilities.
+            y_test: Test true labels.
+            y_test_proba: Test predicted probabilities.
+        
+        Returns:
+            Dictionary with thresholds and metrics.
+        """
+        # Optimize thresholds on validation set
+        thresholds = self.optimize_thresholds(y_val, y_val_proba)
+        
+        # Apply to test set
+        y_pred_optimized = self.predict_with_thresholds(y_test_proba, thresholds)
+        
+        # Compute metrics
+        metrics = {
+            'f1_macro': f1_score(y_test, y_pred_optimized, average='macro', zero_division=0),
+            'balanced_accuracy': balanced_accuracy_score(y_test, y_pred_optimized),
+            'precision_macro': precision_score(y_test, y_pred_optimized, average='macro', zero_division=0),
+            'recall_macro': recall_score(y_test, y_pred_optimized, average='macro', zero_division=0),
+        }
+        
+        print(f"\n   📊 Results with optimized thresholds ({model_name}):")
+        print(f"      F1 Macro: {metrics['f1_macro']:.4f}")
+        print(f"      Balanced Accuracy: {metrics['balanced_accuracy']:.4f}")
+        
+        return {
+            'thresholds': thresholds,
+            'metrics': metrics,
+            'y_pred': y_pred_optimized
+        }
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from typing import Dict, Any, Tuple, Optional
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import f1_score
 import joblib
+from sklearn.model_selection import ParameterSampler
 
 from config import (
     RANDOM_STATE, N_SPLITS, SCORING_METRIC, MODELS_DIR,
@@ -52,10 +53,14 @@ class ModelTrainer:
         # Set up cross-validation strategy
         self.cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
     
-    def _get_xgboost_model(self):
-        """Create XGBoost classifier with fixed params."""
+    def _get_xgboost_model(self, params_override: Optional[Dict[str, Any]] = None):
+        """Create XGBoost classifier with fixed params (optionally overridden)."""
         from xgboost import XGBClassifier
-        
+
+        params = dict(XGBOOST_PARAMS)
+        if params_override:
+            params.update(params_override)
+
         return XGBClassifier(
             objective='multi:softprob',
             eval_metric='mlogloss',
@@ -63,7 +68,7 @@ class ModelTrainer:
             random_state=RANDOM_STATE,
             n_jobs=-1,
             verbosity=0,
-            **XGBOOST_PARAMS
+            **params
         )
     
     def _get_catboost_model(self):
@@ -124,8 +129,14 @@ class ModelTrainer:
         y_pred = model.predict(X_val)
         return f1_score(y_val, y_pred, average='macro')
     
-    def train_xgboost(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train XGBoost with early stopping."""
+    def train_xgboost(
+        self, 
+        X_train: pd.DataFrame, 
+        y_train: np.ndarray,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None,
+        params_override: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Train XGBoost with early stopping (optionally using a provided eval_set)."""
         from sklearn.model_selection import train_test_split
         print("🚀 Training XGBoost...", end=" ", flush=True)
         
@@ -133,16 +144,21 @@ class ModelTrainer:
         if self.class_weights:
             sample_weights = np.array([self.class_weights[y] for y in y_train])
         
-        # Split for early stopping
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-        )
+        if eval_set is None:
+            # Split for early stopping
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+            )
+        else:
+            X_tr, y_tr = X_train, y_train
+            X_val, y_val = eval_set
         
-        model = self._get_xgboost_model()
+        model = self._get_xgboost_model(params_override=params_override)
         
         fit_params = {
             'eval_set': [(X_val, y_val)],
             'verbose': False,
+            'early_stopping_rounds': EARLY_STOPPING_ROUNDS,
         }
         
         if sample_weights is not None:
@@ -160,17 +176,96 @@ class ModelTrainer:
         
         print(f"Done! Val Score: {val_score:.4f}")
         return model
+
+    def tune_xgboost_cv(
+        self,
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+        n_iter: int = 15,
+        cv_splits: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Lightweight random search for XGBoost params using CV on TRAIN ONLY.
+
+        This avoids tuning directly on the held-out validation set, reducing the
+        risk of an overly-optimistic val score vs test.
+        """
+        print(f"\n🧪 Tuning XGBoost (random search, {cv_splits}-fold CV, n_iter={n_iter})...")
+
+        # Small, safe search space for generalization
+        param_dist = {
+            "max_depth": [3, 4, 5, 6, 7],
+            "min_child_weight": [1, 2, 3, 5, 7],
+            "learning_rate": [0.03, 0.05, 0.07, 0.1],
+            "subsample": [0.7, 0.8, 0.9, 1.0],
+            "colsample_bytree": [0.7, 0.8, 0.9, 1.0],
+            "reg_alpha": [0.0, 0.05, 0.1, 0.3],
+            "reg_lambda": [0.8, 1.0, 2.0, 5.0],
+            "gamma": [0.0, 0.25, 0.5, 1.0],
+            # Let early stopping decide effective number of trees; keep ceiling high enough
+            "n_estimators": [800, 1200, 1600],
+        }
+
+        sampler = list(ParameterSampler(param_dist, n_iter=n_iter, random_state=RANDOM_STATE))
+        cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+
+        best_score = -1.0
+        best_params: Dict[str, Any] = {}
+
+        for i, params in enumerate(sampler, start=1):
+            fold_scores = []
+            for tr_idx, va_idx in cv.split(X_train, y_train):
+                X_tr = X_train.iloc[tr_idx] if hasattr(X_train, "iloc") else X_train[tr_idx]
+                y_tr = y_train[tr_idx]
+                X_va = X_train.iloc[va_idx] if hasattr(X_train, "iloc") else X_train[va_idx]
+                y_va = y_train[va_idx]
+
+                model = self._get_xgboost_model(params_override=params)
+
+                fit_params = {
+                    "eval_set": [(X_va, y_va)],
+                    "verbose": False,
+                    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                }
+
+                if self.class_weights:
+                    sw_tr = np.array([self.class_weights[y] for y in y_tr])
+                    fit_params["sample_weight"] = sw_tr
+
+                model.fit(X_tr, y_tr, **fit_params)
+                y_pred = model.predict(X_va)
+                fold_scores.append(f1_score(y_va, y_pred, average="macro", zero_division=0))
+
+            mean_score = float(np.mean(fold_scores)) if fold_scores else -1.0
+            if mean_score > best_score:
+                best_score = mean_score
+                best_params = params
+
+            print(f"   {i:02d}/{len(sampler)} mean_f1_macro={mean_score:.4f} best={best_score:.4f}", end="\r")
+
+        print(" " * 60, end="\r")
+        print(f"✅ Best XGBoost CV macro F1: {best_score:.4f}")
+        print(f"   Best params: {best_params}")
+        return best_params
     
-    def train_catboost(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train CatBoost with early stopping."""
+    def train_catboost(
+        self, 
+        X_train: pd.DataFrame, 
+        y_train: np.ndarray,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None
+    ) -> Any:
+        """Train CatBoost with early stopping (optionally using a provided eval_set)."""
         from sklearn.model_selection import train_test_split
-        from catboost import Pool
         print("🚀 Training CatBoost...", end=" ", flush=True)
         
-        # Split for early stopping
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-        )
+        if eval_set is None:
+            # Split for early stopping
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+            )
+        else:
+            X_tr, y_tr = X_train, y_train
+            X_val, y_val = eval_set
         
         model = self._get_catboost_model()
         
@@ -178,6 +273,7 @@ class ModelTrainer:
             X_tr, y_tr,
             eval_set=(X_val, y_val),
             early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            use_best_model=True,
             verbose=False
         )
         
@@ -191,15 +287,24 @@ class ModelTrainer:
         print(f"Done! Val Score: {val_score:.4f}")
         return model
     
-    def train_balanced_rf(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train BalancedRandomForest (no early stopping for RF)."""
+    def train_balanced_rf(
+        self, 
+        X_train: pd.DataFrame, 
+        y_train: np.ndarray,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None
+    ) -> Any:
+        """Train BalancedRandomForest (no early stopping)."""
         from sklearn.model_selection import train_test_split
         print("🚀 Training BalancedRF...", end=" ", flush=True)
         
-        # Split for validation score
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-        )
+        if eval_set is None:
+            # Split for validation score
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+            )
+        else:
+            X_tr, y_tr = X_train, y_train
+            X_val, y_val = eval_set
         
         model = self._get_balanced_rf_model()
         model.fit(X_tr, y_tr)
@@ -214,8 +319,13 @@ class ModelTrainer:
         print(f"Done! Val Score: {val_score:.4f}")
         return model
     
-    def train_lightgbm(self, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
-        """Train LightGBM with early stopping."""
+    def train_lightgbm(
+        self, 
+        X_train: pd.DataFrame, 
+        y_train: np.ndarray,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None
+    ) -> Any:
+        """Train LightGBM with early stopping (optionally using a provided eval_set)."""
         if not LIGHTGBM_AVAILABLE:
             print("⚠️  LightGBM not available, skipping...")
             return None
@@ -223,10 +333,14 @@ class ModelTrainer:
         from sklearn.model_selection import train_test_split
         print("🚀 Training LightGBM...", end=" ", flush=True)
         
-        # Split for early stopping
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-        )
+        if eval_set is None:
+            # Split for early stopping
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+            )
+        else:
+            X_tr, y_tr = X_train, y_train
+            X_val, y_val = eval_set
         
         model = self._get_lightgbm_model()
         
@@ -251,20 +365,22 @@ class ModelTrainer:
         X_train: pd.DataFrame, 
         y_train: np.ndarray,
         include_lightgbm: bool = True,
-        include_stacking: bool = True
+        include_stacking: bool = True,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None,
+        xgb_params_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Train all models with early stopping."""
         print("\n🎯 Training models...")
         
-        self.train_xgboost(X_train, y_train)
-        self.train_catboost(X_train, y_train)
-        self.train_balanced_rf(X_train, y_train)
+        self.train_xgboost(X_train, y_train, eval_set=eval_set, params_override=xgb_params_override)
+        self.train_catboost(X_train, y_train, eval_set=eval_set)
+        self.train_balanced_rf(X_train, y_train, eval_set=eval_set)
         
         if include_lightgbm and LIGHTGBM_AVAILABLE:
-            self.train_lightgbm(X_train, y_train)
+            self.train_lightgbm(X_train, y_train, eval_set=eval_set)
         
         if include_stacking:
-            self.train_stacking_ensemble(X_train, y_train, include_lightgbm)
+            self.train_stacking_ensemble(X_train, y_train, include_lightgbm, eval_set=eval_set)
         
         return self.models
     
@@ -272,12 +388,12 @@ class ModelTrainer:
         self, 
         X_train: pd.DataFrame, 
         y_train: np.ndarray,
-        include_lightgbm: bool = True
+        include_lightgbm: bool = True,
+        eval_set: Optional[Tuple[pd.DataFrame, np.ndarray]] = None,
     ) -> Any:
         """Train stacking ensemble with base models."""
         from sklearn.ensemble import StackingClassifier
         from sklearn.linear_model import LogisticRegression
-        from sklearn.model_selection import train_test_split
         
         print("🚀 Training Stacking Ensemble...", end=" ", flush=True)
         
@@ -304,16 +420,21 @@ class ModelTrainer:
             n_jobs=-1,
         )
         
-        # Split for validation score
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-        )
-        
-        stacking.fit(X_tr, y_tr)
-        
-        # Validation score
-        y_pred = stacking.predict(X_val)
-        val_score = f1_score(y_val, y_pred, average='macro')
+        # Fit on provided training set; score on provided eval_set if present.
+        stacking.fit(X_train, y_train)
+        if eval_set is not None:
+            X_val, y_val = eval_set
+            y_pred = stacking.predict(X_val)
+            val_score = f1_score(y_val, y_pred, average='macro')
+        else:
+            # Fallback: compute a quick internal score (avoid reporting train score)
+            from sklearn.model_selection import train_test_split
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
+            )
+            stacking.fit(X_tr, y_tr)
+            y_pred = stacking.predict(X_val)
+            val_score = f1_score(y_val, y_pred, average='macro')
         
         self.models['stacking'] = stacking
         self.cv_scores['stacking'] = val_score
